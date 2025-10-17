@@ -3,7 +3,12 @@ package pir
 // #cgo CFLAGS: -O3 -march=native
 // #include "pir.h"
 import "C"
-import "fmt"
+import (
+	"fmt"
+	"os"
+)
+
+var useGPU = os.Getenv("USE_GPU") == "1"
 
 type SimplePIR struct{}
 
@@ -46,43 +51,43 @@ func (pi *SimplePIR) PickParams(N, d, n, logq uint64) Params {
 func (pi *SimplePIR) PickParamsGivenDimensions(l, m, n, logq uint64) Params {
 	p := Params{
 		N:    n,
-                Logq: logq,
-                L:    l,
-                M:    m,
+		Logq: logq,
+		L:    l,
+		M:    m,
 	}
-        p.PickParams(false, m)
-        return p
+	p.PickParams(false, m)
+	return p
 }
 
 // Works for SimplePIR because vertical concatenation doesn't increase
 // the number of LWE samples (so don't need to change LWE params)
 func (pi *SimplePIR) ConcatDBs(DBs []*Database, p *Params) *Database {
-        if len(DBs) == 0 {
-                panic("Should not happen")
-        }
+	if len(DBs) == 0 {
+		panic("Should not happen")
+	}
 
-        if DBs[0].Info.Num != p.L * p.M {
-                panic("Not yet implemented")
-        }
+	if DBs[0].Info.Num != p.L*p.M {
+		panic("Not yet implemented")
+	}
 
-        rows := DBs[0].Data.Rows
-        for j:=1; j<len(DBs); j++ {
-                if DBs[j].Data.Rows != rows {
-                        panic("Bad input")
-                }
-        }
+	rows := DBs[0].Data.Rows
+	for j := 1; j < len(DBs); j++ {
+		if DBs[j].Data.Rows != rows {
+			panic("Bad input")
+		}
+	}
 
-        D := new(Database)
-        D.Data = MatrixZeros(0, 0)
-        D.Info = DBs[0].Info
-        D.Info.Num *= uint64(len(DBs))
-        p.L *= uint64(len(DBs))
+	D := new(Database)
+	D.Data = MatrixZeros(0, 0)
+	D.Info = DBs[0].Info
+	D.Info.Num *= uint64(len(DBs))
+	p.L *= uint64(len(DBs))
 
-	for j:=0; j<len(DBs); j++ {
+	for j := 0; j < len(DBs); j++ {
 		D.Data.Concat(DBs[j].Data.SelectRows(0, rows))
 	}
 
-        return D
+	return D
 }
 
 func (pi *SimplePIR) GetBW(info DBinfo, p Params) {
@@ -97,18 +102,18 @@ func (pi *SimplePIR) GetBW(info DBinfo, p Params) {
 }
 
 func (pi *SimplePIR) Init(info DBinfo, p Params) State {
-        A := MatrixRand(p.M, p.N, p.Logq, 0)
-        return MakeState(A)
+	A := MatrixRand(p.M, p.N, p.Logq, 0)
+	return MakeState(A)
 }
 
 func (pi *SimplePIR) InitCompressed(info DBinfo, p Params) (State, CompressedState) {
 	seed := RandomPRGKey()
-	return pi.InitCompressedSeeded(info, p, seed) 
+	return pi.InitCompressedSeeded(info, p, seed)
 }
 
 func (pi *SimplePIR) InitCompressedSeeded(info DBinfo, p Params, seed *PRGKey) (State, CompressedState) {
-        bufPrgReader = NewBufPRG(NewPRG(seed))
-        return pi.Init(info, p), MakeCompressedState(seed)
+	bufPrgReader = NewBufPRG(NewPRG(seed))
+	return pi.Init(info, p), MakeCompressedState(seed)
 }
 
 func (pi *SimplePIR) DecompressState(info DBinfo, p Params, comp CompressedState) State {
@@ -126,6 +131,10 @@ func (pi *SimplePIR) Setup(DB *Database, shared State, p Params) (State, Msg) {
 	DB.Data.Add(p.P / 2)
 	DB.Squish()
 
+	if useGPU {
+		GPUInitDB(DB.Data)
+	}
+
 	return MakeState(), MakeMsg(H)
 }
 
@@ -138,6 +147,10 @@ func (pi *SimplePIR) FakeSetup(DB *Database, p Params) (State, float64) {
 	// is memory-bandwidth-bound
 	DB.Data.Add(p.P / 2)
 	DB.Squish()
+
+	if useGPU {
+		GPUInitDB(DB.Data)
+	}
 
 	return MakeState(), offline_download
 }
@@ -161,20 +174,26 @@ func (pi *SimplePIR) Query(i uint64, shared State, p Params, info DBinfo) (State
 
 func (pi *SimplePIR) Answer(DB *Database, query MsgSlice, server State, shared State, p Params) Msg {
 	ans := new(Matrix)
-	num_queries := uint64(len(query.Data)) // number of queries in the batch of queries
-	batch_sz := DB.Data.Rows / num_queries // how many rows of the database each query in the batch maps to
+	num_queries := uint64(len(query.Data))
+	batch_sz := DB.Data.Rows / num_queries
 
 	last := uint64(0)
 
-	// Run SimplePIR's answer routine for each query in the batch
 	for batch, q := range query.Data {
 		if batch == int(num_queries-1) {
 			batch_sz = DB.Data.Rows - last
 		}
-		a := MatrixMulVecPacked(DB.Data.SelectRows(last, batch_sz),
-			q.Data[0],
-			DB.Info.Basis,
-			DB.Info.Squishing)
+
+		var a *Matrix
+		if useGPU {
+			a = GPUCompute(q.Data[0], last, batch_sz)
+		} else {
+			a = MatrixMulVecPacked(DB.Data.SelectRows(last, batch_sz),
+				q.Data[0],
+				DB.Info.Basis,
+				DB.Info.Squishing)
+		}
+
 		ans.Concat(a)
 		last += batch_sz
 	}
@@ -188,13 +207,13 @@ func (pi *SimplePIR) Recover(i uint64, batch_index uint64, offline Msg, query Ms
 	H := offline.Data[0]
 	ans := answer.Data[0]
 
-	ratio := p.P/2
-	offset := uint64(0);
-	for j := uint64(0); j<p.M; j++ {
-        	offset += ratio*query.Data[0].Get(j,0)
+	ratio := p.P / 2
+	offset := uint64(0)
+	for j := uint64(0); j < p.M; j++ {
+		offset += ratio * query.Data[0].Get(j, 0)
 	}
 	offset %= (1 << p.Logq)
-	offset = (1 << p.Logq)-offset
+	offset = (1 << p.Logq) - offset
 
 	row := i / p.M
 	interm := MatrixMul(H, secret)
@@ -217,4 +236,8 @@ func (pi *SimplePIR) Reset(DB *Database, p Params) {
 	// Uncompress the database, and map its entries to the range [-p/2, p/2].
 	DB.Unsquish()
 	DB.Data.Sub(p.P / 2)
+	if useGPU {
+		GPUFree()
+	}
+
 }
