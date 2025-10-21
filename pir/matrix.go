@@ -1,9 +1,7 @@
 package pir
 
 // #cgo CFLAGS: -O3 -march=native
-// #cgo LDFLAGS: -L. -lpir_cuda
 // #include "pir.h"
-// #include "simple_pir_cuda.h"
 import "C"
 import (
 	"fmt"
@@ -249,24 +247,6 @@ func (m *Matrix) Transpose() {
 	m.Cols = out.Cols
 	m.Rows = out.Rows
 	m.Data = out.Data
-}
-
-func GPUInitDB(a *Matrix) {
-	C.matMulVecPackedGPUInit((*C.Elem)(&a.Data[0]), C.size_t(a.Rows), C.size_t(a.Cols))
-}
-
-func GPUCompute(b *Matrix, start, rows uint64) *Matrix {
-	out := MatrixNew(rows, 1)
-	C.matMulVecPackedGPUComputeRange(
-		(*C.Elem)(&out.Data[0]),
-		(*C.Elem)(&b.Data[0]),
-		C.size_t(start), C.size_t(rows),
-	)
-	return out
-}
-
-func GPUFree() {
-	C.matMulVecPackedGPUFree()
 }
 
 func (a *Matrix) Concat(b *Matrix) {

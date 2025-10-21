@@ -6,17 +6,22 @@ This repository contains a CUDA implementation of the SimplePIR server to accele
 To run, first compile:
 ```
 cd pir/
-nvcc -O3 -arch=sm_61 -Xcompiler -fPIC -shared simple_pir_cuda.cu -o libpir_cuda.so
+nvcc -O3 -arch=sm_61 -Xcompiler -fPIC -shared simple_pir_cuda.cu double_pir_cuda.cu -o libpir_cuda.so
 ```
 Then, export the library path and run the benchmark:
 ```
-LD_LIBRARY_PATH=$(pwd) LOG_N=33 D=1 USE_GPU=1 go test -bench SimplePirSingle -timeout 0 -run=^
+LD_LIBRARY_PATH=$(pwd) LOG_N=33 D=1 USE_GPU=1 go test -bench SimplePirSingle -timeout 0 -run=^$
 ```
 
 Stats are annotated on kernels using the following machines:
-- CPU: Intel i7-3770 + DRAM
+- CPU: Intel i7-3770 + DDR3 system
+      - SinglePIR: 7-8 GB/s
+      - DoublePIR: 5.5 GB/s
 - GPU: NVIDIA GTX 1080
-
+      - Theoretical max badnwidth: 320 GB/s
+      - Max memory bandwidth (kernel that reads A from GPU memory): 185 GB/s
+      - SimplePIR: 177 GB/s
+      - DoublePIR: 105 GB/s
 
 
 # One Server for the Price of Two: Simple and Fast Single-Server Private Information Retrieval

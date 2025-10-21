@@ -5,10 +5,7 @@ package pir
 import "C"
 import (
 	"fmt"
-	"os"
 )
-
-var useGPU = os.Getenv("USE_GPU") == "1"
 
 type SimplePIR struct{}
 

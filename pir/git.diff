@@ -1,0 +1,1342 @@
+diff --git a/README.md b/README.md
+index 63bd9f7..d4530bd 100644
+--- a/README.md
++++ b/README.md
+@@ -6,7 +6,7 @@ This repository contains a CUDA implementation of the SimplePIR server to accele
+ To run, first compile:
+ ```
+ cd pir/
+-nvcc -O3 -arch=sm_61 -Xcompiler -fPIC -shared simple_pir_cuda.cu -o libpir_cuda.so
++nvcc -O3 -arch=sm_61 -Xcompiler -fPIC -shared simple_pir_cuda.cu double_pir_cuda.cu -o libpir_cuda.so
+ ```
+ Then, export the library path and run the benchmark:
+ ```
+@@ -14,9 +14,11 @@ LD_LIBRARY_PATH=$(pwd) LOG_N=33 D=1 USE_GPU=1 go test -bench SimplePirSingle -ti
+ ```
+ 
+ Stats are annotated on kernels using the following machines:
+-- CPU: Intel i7-3770 + DRAM
++- CPU: Intel i7-3770 + DDR3 system
++      - SinglePIR: 7-8 GB/s
++      - DoublePIR: 5.5 GB/s
+ - GPU: NVIDIA GTX 1080
+-
++      - SimplePIR: 177 GB/s
+ 
+ 
+ # One Server for the Price of Two: Simple and Fast Single-Server Private Information Retrieval
+diff --git a/pir/double_pir.go b/pir/double_pir.go
+index af26870..7dd0779 100644
+--- a/pir/double_pir.go
++++ b/pir/double_pir.go
+@@ -59,10 +59,10 @@ func (pi *DoublePIR) PickParamsGivenDimensions(l, m, n, logq uint64) Params {
+ 		N:    n,
+ 		Logq: logq,
+ 		L:    l,
+-                M:    m,
++		M:    m,
+ 	}
+-        p.PickParams(true, l, m)
+-        return p
++	p.PickParams(true, l, m)
++	return p
+ }
+ 
+ func (pi *DoublePIR) GetBW(info DBinfo, p Params) {
+@@ -84,18 +84,18 @@ func (pi *DoublePIR) Init(info DBinfo, p Params) State {
+ }
+ 
+ func (pi *DoublePIR) InitCompressed(info DBinfo, p Params) (State, CompressedState) {
+-        seed := RandomPRGKey()
++	seed := RandomPRGKey()
+ 	return pi.InitCompressedSeeded(info, p, seed)
+ }
+ 
+ func (pi *DoublePIR) InitCompressedSeeded(info DBinfo, p Params, seed *PRGKey) (State, CompressedState) {
+-        bufPrgReader = NewBufPRG(NewPRG(seed))
+-        return pi.Init(info, p), MakeCompressedState(seed)
++	bufPrgReader = NewBufPRG(NewPRG(seed))
++	return pi.Init(info, p), MakeCompressedState(seed)
+ }
+ 
+ func (pi *DoublePIR) DecompressState(info DBinfo, p Params, comp CompressedState) State {
+-        bufPrgReader = NewBufPRG(NewPRG(comp.Seed))
+-        return pi.Init(info, p)
++	bufPrgReader = NewBufPRG(NewPRG(comp.Seed))
++	return pi.Init(info, p)
+ }
+ 
+ func (pi *DoublePIR) Setup(DB *Database, shared State, p Params) (State, Msg) {
+@@ -117,11 +117,15 @@ func (pi *DoublePIR) Setup(DB *Database, shared State, p Params) (State, Msg) {
+ 	H1.Squish(10, 3)
+ 
+ 	A2_copy := A2.RowsDeepCopy(0, A2.Rows) // deep copy whole matrix
+-	if A2_copy.Rows % 3 != 0 {
+-                A2_copy.Concat(MatrixZeros(3-(A2_copy.Rows%3), A2_copy.Cols))
+-        }
++	if A2_copy.Rows%3 != 0 {
++		A2_copy.Concat(MatrixZeros(3-(A2_copy.Rows%3), A2_copy.Cols))
++	}
+ 	A2_copy.Transpose()
+ 
++	if useGPU {
++		DoubleGPUInit(DB.Data, H1, A2_copy, DB.Info.X, p.delta())
++	}
++
+ 	return MakeState(H1, A2_copy), MakeMsg(H2)
+ }
+ 
+@@ -138,9 +142,9 @@ func (pi *DoublePIR) FakeSetup(DB *Database, p Params) (State, float64) {
+ 	H1.Add(p.P / 2)
+ 	H1.Squish(10, 3)
+ 
+-	A2_rows := p.L/info.X
+-	if A2_rows % 3 != 0 {
+-		A2_rows += (3-(A2_rows % 3))
++	A2_rows := p.L / info.X
++	if A2_rows%3 != 0 {
++		A2_rows += (3 - (A2_rows % 3))
+ 	}
+ 	A2_copy := MatrixRand(p.N, A2_rows, p.Logq, 0)
+ 
+@@ -187,77 +191,106 @@ func (pi *DoublePIR) Query(i uint64, shared State, p Params, info DBinfo) (State
+ 
+ func (pi *DoublePIR) Answer(DB *Database, query MsgSlice, server State, shared State, p Params) Msg {
+ 	H1 := server.Data[0]
+-	A2_transpose := server.Data[1]
++	A2t := server.Data[1]
+ 
+ 	a1 := new(Matrix)
+-	num_queries := uint64(len(query.Data))
+-	batch_sz := DB.Data.Rows / num_queries
+-
++	numQueries := uint64(len(query.Data))
++	batchSz := DB.Data.Rows / numQueries
+ 	last := uint64(0)
++
++	// For each batch, do everything on GPU and pull back only {h1, a2, h2}.
++	msg := MakeMsg(MatrixZeros(0, 0))
+ 	for batch, q := range query.Data {
+-		q1 := q.Data[0]
+-		if batch == int(num_queries-1) {
+-			batch_sz = DB.Data.Rows - last
++		if batch == int(numQueries-1) {
++			batchSz = DB.Data.Rows - last
+ 		}
+-		a := MatrixMulVecPacked(DB.Data.SelectRows(last, batch_sz),
+-			                q1, DB.Info.Basis, DB.Info.Squishing)
+-		a1.Concat(a)
+-		last += batch_sz
+-	}
+ 
+-	a1.TransposeAndExpandAndConcatColsAndSquish(p.P, p.delta(), DB.Info.X, 10, 3)
+-        h1 := MatrixMulTransposedPacked(a1, A2_transpose, 10, 3)
+-	msg := MakeMsg(h1)
++		if useGPU {
++			// Allocate outputs
++			h1Rows := p.delta() * DB.Info.X
++			h1Cols := ((batchSz / DB.Info.X) + 3 - 1) / 3 // per TransposeExpand... (d=3)
++			h1 := MatrixZeros(h1Rows, h1Cols)
+ 
+-	for _, q := range query.Data {
+-		for j := uint64(0); j < DB.Info.Ne/DB.Info.X; j++ {
+-			q2 := q.Data[1+j]
+-			a2 := MatrixMulVecPacked(H1, q2, 10, 3)
+-			h2 := MatrixMulVecPacked(a1, q2, 10, 3)
++			a2All := MatrixZeros(H1.Rows*(DB.Info.Ne/DB.Info.X), 1)
++			h2All := MatrixZeros(h1Rows*(DB.Info.Ne/DB.Info.X), 1)
+ 
+-			msg.Data = append(msg.Data, a2)
+-			msg.Data = append(msg.Data, h2)
++			// Collect this batch’s q2’s
++			var q2s []*Matrix
++			for j := uint64(0); j < DB.Info.Ne/DB.Info.X; j++ {
++				q2s = append(q2s, q.Data[1+j])
++			}
++
++			DoubleGPUAnswerRange(q.Data[0], q2s, last, batchSz, h1, a2All, h2All)
++
++			// Append in the exact order your original Answer produces:
++			msg.Data = append(msg.Data, h1)
++			for j := uint64(0); j < DB.Info.Ne/DB.Info.X; j++ {
++				// slice views for a2/h2 per query2
++				a2 := a2All.RowsDeepCopy(j*H1.Rows, H1.Rows)
++				h2 := h2All.RowsDeepCopy(j*h1Rows, h1Rows)
++				msg.Data = append(msg.Data, a2, h2)
++			}
++		} else {
++			// original CPU path
++			a := MatrixMulVecPacked(DB.Data.SelectRows(last, batchSz), q.Data[0], DB.Info.Basis, DB.Info.Squishing)
++			a1.Concat(a)
+ 		}
++		last += batchSz
+ 	}
+ 
++	if !useGPU {
++		// original CPU h1/a2/h2 path (unchanged)
++		a1.TransposeAndExpandAndConcatColsAndSquish(p.P, p.delta(), DB.Info.X, 10, 3)
++		h1 := MatrixMulTransposedPacked(a1, A2t, 10, 3)
++		out := MakeMsg(h1)
++		for _, q := range query.Data {
++			for j := uint64(0); j < DB.Info.Ne/DB.Info.X; j++ {
++				q2 := q.Data[1+j]
++				a2 := MatrixMulVecPacked(H1, q2, 10, 3)
++				h2 := MatrixMulVecPacked(a1, q2, 10, 3)
++				out.Data = append(out.Data, a2, h2)
++			}
++		}
++		return out
++	}
+ 	return msg
+ }
+ 
+ func (pi *DoublePIR) Recover(i uint64, batch_index uint64, offline Msg, query Msg,
+ 	answer Msg, shared State, client State, p Params, info DBinfo) uint64 {
+ 	H2 := offline.Data[0]
+-	h1 := answer.Data[0].RowsDeepCopy(0, answer.Data[0].Rows) // deep copy whole matrix 
++	h1 := answer.Data[0].RowsDeepCopy(0, answer.Data[0].Rows) // deep copy whole matrix
+ 	secret1 := client.Data[0]
+ 
+-	ratio := p.P/2
++	ratio := p.P / 2
+ 	val1 := uint64(0)
+-	for j := uint64(0); j<p.M; j++ {
+-		val1 += ratio*query.Data[0].Get(j,0)
++	for j := uint64(0); j < p.M; j++ {
++		val1 += ratio * query.Data[0].Get(j, 0)
+ 	}
+-	val1 %= (1<<p.Logq)
+-	val1 = (1<<p.Logq)-val1
++	val1 %= (1 << p.Logq)
++	val1 = (1 << p.Logq) - val1
+ 
+ 	val2 := uint64(0)
+-	for j := uint64(0); j<p.L/info.X; j++ {
+-		val2 += ratio*query.Data[1].Get(j,0)
++	for j := uint64(0); j < p.L/info.X; j++ {
++		val2 += ratio * query.Data[1].Get(j, 0)
+ 	}
+-	val2 %= (1<<p.Logq)
+-	val2 = (1<<p.Logq)-val2
++	val2 %= (1 << p.Logq)
++	val2 = (1 << p.Logq) - val2
+ 
+ 	A2 := shared.Data[1]
+ 	if (A2.Cols != p.N) || (h1.Cols != p.N) {
+ 		panic("Should not happen!")
+ 	}
+-	for j1 := uint64(0); j1<p.N; j1++ {
++	for j1 := uint64(0); j1 < p.N; j1++ {
+ 		val3 := uint64(0)
+-	        for j2 := uint64(0); j2<A2.Rows; j2++ {
+-			val3 += ratio*A2.Get(j2,j1)
++		for j2 := uint64(0); j2 < A2.Rows; j2++ {
++			val3 += ratio * A2.Get(j2, j1)
+ 		}
+-		val3 %= (1<<p.Logq)
+-		val3 = (1<<p.Logq)-val3
++		val3 %= (1 << p.Logq)
++		val3 = (1 << p.Logq) - val3
+ 		v := C.Elem(val3)
+-		for k := uint64(0); k<h1.Rows; k++ {
+-                	h1.Data[k*h1.Cols+j1] += v
++		for k := uint64(0); k < h1.Rows; k++ {
++			h1.Data[k*h1.Cols+j1] += v
+ 		}
+ 	}
+ 
+diff --git a/pir/double_pir_cuda.cu b/pir/double_pir_cuda.cu
+new file mode 100644
+index 0000000..69e2b64
+--- /dev/null
++++ b/pir/double_pir_cuda.cu
+@@ -0,0 +1,348 @@
++// double_pir_cuda.cu
++#include <cuda_runtime.h>
++#include <cstdio>
++#include "double_pir_cuda.h"
++
++#ifndef TILE_COLS
++#define TILE_COLS 4096
++#endif
++
++#ifndef BLOCK_SIZE
++#define BLOCK_SIZE 1024
++#endif
++
++static constexpr int  BASIS        = 10;
++static constexpr int  COMPRESSION  = 3;
++static constexpr Elem MASK         = (1u << BASIS) - 1u;
++
++#define CUDA_ASSERT(stmt) do { \
++    cudaError_t err = (stmt);  \
++    if (err != cudaSuccess) {  \
++        fprintf(stderr, "CUDA error: %s (%s:%d)\n", cudaGetErrorString(err), __FILE__, __LINE__); \
++        abort();               \
++    }                          \
++} while (0)
++
++// ------------------ Persistent device buffers ------------------
++static Elem* d_DB   = nullptr;  static size_t DB_rows=0,  DB_cols=0;
++static Elem* d_H1   = nullptr;  static size_t H1_rows=0,  H1_cols=0;
++static Elem* d_A2t  = nullptr;  static size_t A2t_rows=0, A2t_cols=0;
++
++static Elem* d_q1   = nullptr;  static size_t cap_q1 = 0;
++static Elem* d_q2   = nullptr;  static size_t cap_q2 = 0;
++
++static unsigned int g_X = 1;
++static unsigned int g_delta = 1;
++
++// scratch
++static unsigned long long* d_acc64 = nullptr;      // max(rows) accumulator
++static size_t              cap_acc64 = 0;
++static Elem*               d_vec_out = nullptr;    // staging for a single vec result
++static size_t              cap_vec_out = 0;
++
++// ------------------ Kernels ------------------
++
++// Warp-span, shared-b tile, K rows/warp (same style as SimplePIR)
++template<int K>
++__global__ void matMulVecPackedWarpSpanTileK(Elem * __restrict__ out,
++                                             const Elem * __restrict__ a,
++                                             const Elem * __restrict__ b,
++                                             size_t aRows, size_t aCols,
++                                             size_t startRow, size_t numRows)
++{
++    const int lane   = threadIdx.x & 31;
++    const int warpId = threadIdx.x >> 5;
++    const int warpsPerBlock = blockDim.x >> 5;
++
++    const size_t warpPackBaseLocal =
++        (size_t)blockIdx.x * (size_t)(warpsPerBlock * K) + (size_t)warpId * (size_t)K;
++    if (warpPackBaseLocal >= numRows) return;
++
++    extern __shared__ Elem s_b[];
++    Elem* s_b0 = s_b + 0 * TILE_COLS;
++    Elem* s_b1 = s_b + 1 * TILE_COLS;
++    Elem* s_b2 = s_b + 2 * TILE_COLS;
++
++    unsigned long long acc[K];
++    #pragma unroll
++    for (int r=0; r<K; ++r) acc[r] = 0ull;
++
++    for (size_t tileBase = 0; tileBase < aCols; tileBase += TILE_COLS) {
++        const size_t tileCols = min((size_t)TILE_COLS, aCols - tileBase);
++
++        // cooperative b tile load
++        for (size_t c = threadIdx.x; c < tileCols; c += blockDim.x) {
++            const size_t j = tileBase + c;
++            s_b0[c] = __ldg(&b[j * COMPRESSION + 0]);
++            s_b1[c] = __ldg(&b[j * COMPRESSION + 1]);
++            s_b2[c] = __ldg(&b[j * COMPRESSION + 2]);
++        }
++        __syncthreads();
++
++        #pragma unroll
++        for (int r=0; r<K; ++r) {
++            const size_t rowLocal = warpPackBaseLocal + (size_t)r;
++            if (rowLocal >= numRows) break;
++            const size_t row      = startRow + rowLocal;
++            const size_t rowBaseA = row * aCols + tileBase;
++
++            for (size_t c = lane; c < tileCols; c += 32) {
++                Elem db = __ldg(&a[rowBaseA + c]);
++                Elem v0 =  db               & MASK;
++                Elem v1 = (db >> BASIS)     & MASK;
++                Elem v2 = (db >> (2*BASIS)) & MASK;
++                acc[r] += (unsigned long long)v0 * (unsigned long long)s_b0[c];
++                acc[r] += (unsigned long long)v1 * (unsigned long long)s_b1[c];
++                acc[r] += (unsigned long long)v2 * (unsigned long long)s_b2[c];
++            }
++        }
++        __syncthreads();
++    }
++
++    // reduce & write
++    #pragma unroll
++    for (int r=0; r<K; ++r) {
++        const size_t rowLocal = warpPackBaseLocal + (size_t)r;
++        if (rowLocal >= numRows) break;
++        unsigned long long v = acc[r];
++        #pragma unroll
++        for (int off=16; off>0; off>>=1) v += __shfl_down_sync(0xffffffff, v, off);
++        if ((threadIdx.x & 31) == 0) out[startRow + rowLocal] = (Elem)v; // truncation == mod 2^w
++    }
++}
++
++// Extract f-th base-p digit from v (small delta => loop is fine).
++__device__ __forceinline__ uint32_t base_p_digit(uint64_t v, uint32_t f, uint32_t p) {
++    for (uint32_t i=0;i<f;++i) v /= p;
++    return (uint32_t)(v % p);
++}
++
++// Port of your Go function:
++//   TransposeAndExpandAndConcatColsAndSquish(mod, delta, concat, basis, d)
++// Input m: rows=R, cols=C (here C typically 1). Output n: rows=C*delta*concat, cols=(R/concat + d-1)/d
++// We parallelize over (r, cIdx) and pack d limbs into one Elem -> single write, no atomics.
++__global__ void transpose_expand_concat_squish_kernel(
++    const Elem* __restrict__ m,  // size R*C (row-major)
++    uint32_t R, uint32_t C,
++    uint32_t mod_p, uint32_t delta, uint32_t concat, uint32_t basis, uint32_t d,
++    Elem* __restrict__ n,        // out rows = C*delta*concat, cols = (R/concat + d-1)/d
++    uint32_t nRows, uint32_t nCols)
++{
++    const uint32_t outLinear = blockIdx.x * blockDim.x + threadIdx.x;
++    const uint32_t totalOut  = nRows * nCols;
++    if (outLinear >= totalOut) return;
++
++    const uint32_t r = outLinear / nCols;       // 0..(C*delta*concat-1)
++    const uint32_t cIdx = outLinear % nCols;    // 0..nCols-1
++
++    const uint32_t stripe = (r / delta) % concat;   // j % concat
++    const uint32_t f      = (r % delta);            // which base-p digit
++    const uint32_t Cmax   = (R + concat - 1) / concat; // ceil(R/concat)
++
++    uint64_t packed = 0ull;
++
++    // pack d columns: c = cIdx*d + t
++    for (uint32_t t=0; t<d; ++t) {
++        const uint32_t c = cIdx * d + t;
++        if (c >= Cmax) break; // tail
++        const uint32_t j = c * concat + stripe; // row index in input m
++        if (j >= R) continue;
++
++        // m has C columns; here C is usually 1, but keep general:
++        // value at (j,i) for i=0..C-1 are stacked by "i" in your original
++        // We need i (column in m) such that r = (i*delta + f) + C*delta*(j%concat)
++        // For general C, derive i from r:
++        const uint32_t i = (r / delta) / concat; // because: r = (i*delta + f) + C*delta*(j%concat); when C==1 -> i==0
++        if (i >= C) continue;
++
++        const uint64_t val = (uint64_t)m[j*C + i];
++        const uint32_t digit = base_p_digit(val, f, mod_p);
++
++        packed += (uint64_t)digit << (basis * t); // shift by t==(c%d)
++    }
++
++    n[r * nCols + cIdx] = (Elem)packed;
++}
++
++// ------------------ Helpers ------------------
++
++static inline void ensure_buf(Elem** p, size_t* cap, size_t need) {
++    if (*cap >= need) return;
++    if (*p) CUDA_ASSERT(cudaFree(*p));
++    CUDA_ASSERT(cudaMalloc(p, need * sizeof(Elem)));
++    *cap = need;
++}
++
++static inline void ensure_acc(size_t need64) {
++    if (cap_acc64 >= need64) return;
++    if (d_acc64) CUDA_ASSERT(cudaFree(d_acc64));
++    CUDA_ASSERT(cudaMalloc(&d_acc64, need64 * sizeof(unsigned long long)));
++    cap_acc64 = need64;
++}
++
++static inline void ensure_vec(size_t need) {
++    if (cap_vec_out >= need) return;
++    if (d_vec_out) CUDA_ASSERT(cudaFree(d_vec_out));
++    CUDA_ASSERT(cudaMalloc(&d_vec_out, need * sizeof(Elem)));
++    cap_vec_out = need;
++}
++
++// ------------------ Public API ------------------
++
++extern "C" void doublePIRGPUInit(const Elem* DB, size_t DB_r, size_t DB_c,
++                                  const Elem* H1, size_t H1_r, size_t H1_c,
++                                  const Elem* A2t, size_t A2t_r, size_t A2t_c,
++                                  unsigned int X, unsigned int delta)
++{
++    DB_rows=DB_r; DB_cols=DB_c; H1_rows=H1_r; H1_cols=H1_c; A2t_rows=A2t_r; A2t_cols=A2t_c;
++    g_X = X; g_delta = delta;
++
++    CUDA_ASSERT(cudaMalloc(&d_DB,  DB_r*DB_c*sizeof(Elem)));
++    CUDA_ASSERT(cudaMalloc(&d_H1,  H1_r*H1_c*sizeof(Elem)));
++    CUDA_ASSERT(cudaMalloc(&d_A2t, A2t_r*A2t_c*sizeof(Elem)));
++
++    CUDA_ASSERT(cudaMemcpy(d_DB,  DB,  DB_r*DB_c*sizeof(Elem),  cudaMemcpyHostToDevice));
++    CUDA_ASSERT(cudaMemcpy(d_H1,  H1,  H1_r*H1_c*sizeof(Elem),  cudaMemcpyHostToDevice));
++    CUDA_ASSERT(cudaMemcpy(d_A2t, A2t, A2t_r*A2t_c*sizeof(Elem),cudaMemcpyHostToDevice));
++}
++
++
++extern "C" void doublePIRGPUAnswerRange(const Elem* q1, size_t q1_len,
++                                        const Elem* q2s, size_t q2_len, int numQ2,
++                                        size_t startRow, size_t numRows,
++                                        Elem* h1_out, size_t h1_rows, size_t h1_cols,
++                                        Elem* a2_out_all, size_t a2_vec_len,
++                                        Elem* h2_out_all, size_t h2_vec_len)
++{
++    // 1) upload q1
++    ensure_buf(&d_q1, &cap_q1, q1_len);
++    CUDA_ASSERT(cudaMemcpy(d_q1, q1, q1_len*sizeof(Elem), cudaMemcpyHostToDevice));
++
++    // 2) a1 := (DB[start:start+numRows] · q1)
++    ensure_acc(numRows);
++    {
++        dim3 block(BLOCK_SIZE);
++        const int warpsPerBlock = BLOCK_SIZE / 32;
++        const int K = 4;
++        const size_t rowsPerBlockLogical = (size_t)warpsPerBlock * (size_t)K;
++        dim3 grid( (int)((numRows + rowsPerBlockLogical - 1) / rowsPerBlockLogical) );
++        const size_t shmemBytes = (size_t)TILE_COLS * (size_t)COMPRESSION * sizeof(Elem);
++
++        matMulVecPackedWarpSpanTileK<4><<<grid, block, shmemBytes>>>(
++            (Elem*)d_acc64,
++            d_DB, d_q1, DB_rows, DB_cols, startRow, numRows);
++    }
++    CUDA_ASSERT(cudaGetLastError());
++
++    // 3) a1':= TransposeAndExpandAndConcatColsAndSquish(a1)
++    //    m.Rows = numRows, m.Cols = 1
++    //    n.Rows = (1 * delta * X), n.Cols = (numRows/X + d - 1)/d, where d=3, basis=10
++    const uint32_t R = (uint32_t)numRows;
++    const uint32_t C = 1u;
++    const uint32_t d  = 3u;
++    const uint32_t basis = 10u;
++    const uint32_t nRows = C * g_delta * g_X;
++    const uint32_t Cmax  = (R + g_X - 1) / g_X;
++    const uint32_t nCols = (Cmax + d - 1) / d;
++
++    Elem* d_a1_packed = nullptr;
++    CUDA_ASSERT(cudaMalloc(&d_a1_packed, (size_t)nRows * (size_t)nCols * sizeof(Elem)));
++
++    {
++        const uint32_t totalOut = nRows * nCols;
++        const int threads = 256;
++        const int blocks = (int)((totalOut + threads - 1) / threads);
++        transpose_expand_concat_squish_kernel<<<blocks, threads>>>(
++            (Elem*)d_acc64, R, C,
++            /*mod*/0u, g_delta, g_X, basis, d,
++            d_a1_packed, nRows, nCols);
++    }
++    CUDA_ASSERT(cudaGetLastError());
++
++    // 4) h1 := a1_packed · A2ᵗ  (loop rows of A2ᵗ -> packed GEMV)
++    ensure_vec(h1_rows * h1_cols);
++    for (size_t rB = 0; rB < h1_rows; ++rB) {
++        const Elem* d_b = d_A2t + rB * A2t_cols; // row rB, length nCols (packed with 3 limbs/col)
++
++        ensure_acc(nRows);
++        {
++            dim3 block(BLOCK_SIZE);
++            const int warpsPerBlock = BLOCK_SIZE / 32;
++            const int K = 4;
++            const size_t rowsPerBlockLogical = (size_t)warpsPerBlock * (size_t)K;
++            dim3 grid( (int)((nRows + rowsPerBlockLogical - 1) / rowsPerBlockLogical) );
++            const size_t shmemBytes = (size_t)TILE_COLS * (size_t)COMPRESSION * sizeof(Elem);
++
++            matMulVecPackedWarpSpanTileK<4><<<grid, block, shmemBytes>>>(
++                (Elem*)d_acc64, d_a1_packed, d_b, nRows, nCols, /*startRow*/0, /*numRows*/nRows);
++        }
++        CUDA_ASSERT(cudaGetLastError());
++
++        // Copy this column vector out (layout note remains as before)
++        CUDA_ASSERT(cudaMemcpy(d_vec_out, d_acc64, nRows*sizeof(Elem), cudaMemcpyDeviceToDevice));
++        CUDA_ASSERT(cudaMemcpy(h1_out + rB, d_vec_out, nRows*sizeof(Elem), cudaMemcpyDeviceToHost));
++    }
++
++    // 5) For each q2: compute a single combined matvec on [H1; a1_packed]
++    //    and split the outputs into a2 (top H1_rows) and h2 (bottom nRows).
++    const size_t totalRows   = H1_rows + nRows;
++    const size_t commonCols  = H1_cols; // expected to match nCols for packed layout
++
++    Elem* d_concat = nullptr;
++    CUDA_ASSERT(cudaMalloc(&d_concat, totalRows * commonCols * sizeof(Elem)));
++    // top: H1
++    CUDA_ASSERT(cudaMemcpy(d_concat,
++                           d_H1,
++                           H1_rows * commonCols * sizeof(Elem),
++                           cudaMemcpyDeviceToDevice));
++    // bottom: a1_packed
++    CUDA_ASSERT(cudaMemcpy(d_concat + H1_rows * commonCols,
++                           d_a1_packed,
++                           nRows * commonCols * sizeof(Elem),
++                           cudaMemcpyDeviceToDevice));
++
++    for (int k=0; k<numQ2; ++k) {
++        const Elem* q2_host = q2s + (size_t)k * q2_len;
++        ensure_buf(&d_q2, &cap_q2, q2_len);
++        CUDA_ASSERT(cudaMemcpy(d_q2, q2_host, q2_len*sizeof(Elem), cudaMemcpyHostToDevice));
++
++        // combined matvec: [H1; a1_packed] · q2
++        ensure_acc(totalRows);
++        {
++            dim3 block(BLOCK_SIZE);
++            const int warpsPerBlock = BLOCK_SIZE / 32;
++            const int K = 4;
++            const size_t rowsPerBlockLogical = (size_t)warpsPerBlock * (size_t)K;
++            dim3 grid( (int)((totalRows + rowsPerBlockLogical - 1) / rowsPerBlockLogical) );
++            const size_t shmemBytes = (size_t)TILE_COLS * (size_t)COMPRESSION * sizeof(Elem);
++
++            matMulVecPackedWarpSpanTileK<4><<<grid, block, shmemBytes>>>(
++                (Elem*)d_acc64, d_concat, d_q2, totalRows, commonCols, 0, totalRows);
++        }
++        CUDA_ASSERT(cudaGetLastError());
++
++        // split output buffer: first H1_rows -> a2, next nRows -> h2
++        CUDA_ASSERT(cudaMemcpy(a2_out_all + (size_t)k * a2_vec_len,
++                               d_acc64,
++                               H1_rows*sizeof(Elem),
++                               cudaMemcpyDeviceToHost));
++        CUDA_ASSERT(cudaMemcpy(h2_out_all + (size_t)k * h2_vec_len,
++                               d_acc64 + H1_rows,
++                               nRows*sizeof(Elem),
++                               cudaMemcpyDeviceToHost));
++    }
++
++    CUDA_ASSERT(cudaFree(d_concat));
++    CUDA_ASSERT(cudaFree(d_a1_packed));
++}
++
++extern "C" void doublePIRGPUFree(void)
++{
++    if (d_DB)    { CUDA_ASSERT(cudaFree(d_DB));    d_DB=nullptr; }
++    if (d_H1)    { CUDA_ASSERT(cudaFree(d_H1));    d_H1=nullptr; }
++    if (d_A2t)   { CUDA_ASSERT(cudaFree(d_A2t));   d_A2t=nullptr; }
++    if (d_q1)    { CUDA_ASSERT(cudaFree(d_q1));    d_q1=nullptr; cap_q1=0; }
++    if (d_q2)    { CUDA_ASSERT(cudaFree(d_q2));    d_q2=nullptr; cap_q2=0; }
++    if (d_acc64) { CUDA_ASSERT(cudaFree(d_acc64)); d_acc64=nullptr; cap_acc64=0; }
++    if (d_vec_out){ CUDA_ASSERT(cudaFree(d_vec_out)); d_vec_out=nullptr; cap_vec_out=0; }
++}
+diff --git a/pir/double_pir_cuda.h b/pir/double_pir_cuda.h
+new file mode 100644
+index 0000000..472b10c
+--- /dev/null
++++ b/pir/double_pir_cuda.h
+@@ -0,0 +1,39 @@
++// double_pir_cuda.h
++#pragma once
++#include <stddef.h>
++#include <stdint.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++typedef uint32_t Elem;
++
++// Initialize persistent GPU state (upload DB, H1, A2t).  X=info.X, delta=p.delta().
++void doublePIRGPUInit(const Elem* DB, size_t DB_rows, size_t DB_cols,
++                      const Elem* H1, size_t H1_rows, size_t H1_cols,
++                      const Elem* A2t, size_t A2t_rows, size_t A2t_cols,
++                      unsigned int X, unsigned int delta);
++
++// Core Answer computation for a DB batch [startRow, startRow+numRows):
++//  - q1: packed (DB_cols * 3)
++//  - q2s: concatenated packed queries (numQ2 of length q2_len = cols*3)
++//  - Produces: h1, a2_all, h2_all (host buffers provided by caller).
++//
++// Shapes you pass here must match your host code:
++//   * h1:  (h1_rows x h1_cols)  (same as out of MatrixMulTransposedPacked)
++//   * a2:  H1_rows entries per q2
++//   * h2:  (a1_packed_rows) entries per q2  (rows = delta*X)
++void doublePIRGPUAnswerRange(const Elem* q1, size_t q1_len,
++                             const Elem* q2s, size_t q2_len, int numQ2,
++                             size_t startRow, size_t numRows,
++                             Elem* h1_out, size_t h1_rows, size_t h1_cols,
++                             Elem* a2_out_all, size_t a2_vec_len,
++                             Elem* h2_out_all, size_t h2_vec_len);
++
++// Free all device buffers.
++void doublePIRGPUFree(void);
++
++#ifdef __cplusplus
++}
++#endif
+diff --git a/pir/git.diff b/pir/git.diff
+new file mode 100644
+index 0000000..737fc75
+--- /dev/null
++++ b/pir/git.diff
+@@ -0,0 +1,550 @@
++diff --git a/README.md b/README.md
++index 63bd9f7..d4530bd 100644
++--- a/README.md
+++++ b/README.md
++@@ -6,7 +6,7 @@ This repository contains a CUDA implementation of the SimplePIR server to accele
++ To run, first compile:
++ ```
++ cd pir/
++-nvcc -O3 -arch=sm_61 -Xcompiler -fPIC -shared simple_pir_cuda.cu -o libpir_cuda.so
+++nvcc -O3 -arch=sm_61 -Xcompiler -fPIC -shared simple_pir_cuda.cu double_pir_cuda.cu -o libpir_cuda.so
++ ```
++ Then, export the library path and run the benchmark:
++ ```
++@@ -14,9 +14,11 @@ LD_LIBRARY_PATH=$(pwd) LOG_N=33 D=1 USE_GPU=1 go test -bench SimplePirSingle -ti
++ ```
++ 
++ Stats are annotated on kernels using the following machines:
++-- CPU: Intel i7-3770 + DRAM
+++- CPU: Intel i7-3770 + DDR3 system
+++      - SinglePIR: 7-8 GB/s
+++      - DoublePIR: 5.5 GB/s
++ - GPU: NVIDIA GTX 1080
++-
+++      - SimplePIR: 177 GB/s
++ 
++ 
++ # One Server for the Price of Two: Simple and Fast Single-Server Private Information Retrieval
++diff --git a/pir/double_pir.go b/pir/double_pir.go
++index af26870..7dd0779 100644
++--- a/pir/double_pir.go
+++++ b/pir/double_pir.go
++@@ -59,10 +59,10 @@ func (pi *DoublePIR) PickParamsGivenDimensions(l, m, n, logq uint64) Params {
++ 		N:    n,
++ 		Logq: logq,
++ 		L:    l,
++-                M:    m,
+++		M:    m,
++ 	}
++-        p.PickParams(true, l, m)
++-        return p
+++	p.PickParams(true, l, m)
+++	return p
++ }
++ 
++ func (pi *DoublePIR) GetBW(info DBinfo, p Params) {
++@@ -84,18 +84,18 @@ func (pi *DoublePIR) Init(info DBinfo, p Params) State {
++ }
++ 
++ func (pi *DoublePIR) InitCompressed(info DBinfo, p Params) (State, CompressedState) {
++-        seed := RandomPRGKey()
+++	seed := RandomPRGKey()
++ 	return pi.InitCompressedSeeded(info, p, seed)
++ }
++ 
++ func (pi *DoublePIR) InitCompressedSeeded(info DBinfo, p Params, seed *PRGKey) (State, CompressedState) {
++-        bufPrgReader = NewBufPRG(NewPRG(seed))
++-        return pi.Init(info, p), MakeCompressedState(seed)
+++	bufPrgReader = NewBufPRG(NewPRG(seed))
+++	return pi.Init(info, p), MakeCompressedState(seed)
++ }
++ 
++ func (pi *DoublePIR) DecompressState(info DBinfo, p Params, comp CompressedState) State {
++-        bufPrgReader = NewBufPRG(NewPRG(comp.Seed))
++-        return pi.Init(info, p)
+++	bufPrgReader = NewBufPRG(NewPRG(comp.Seed))
+++	return pi.Init(info, p)
++ }
++ 
++ func (pi *DoublePIR) Setup(DB *Database, shared State, p Params) (State, Msg) {
++@@ -117,11 +117,15 @@ func (pi *DoublePIR) Setup(DB *Database, shared State, p Params) (State, Msg) {
++ 	H1.Squish(10, 3)
++ 
++ 	A2_copy := A2.RowsDeepCopy(0, A2.Rows) // deep copy whole matrix
++-	if A2_copy.Rows % 3 != 0 {
++-                A2_copy.Concat(MatrixZeros(3-(A2_copy.Rows%3), A2_copy.Cols))
++-        }
+++	if A2_copy.Rows%3 != 0 {
+++		A2_copy.Concat(MatrixZeros(3-(A2_copy.Rows%3), A2_copy.Cols))
+++	}
++ 	A2_copy.Transpose()
++ 
+++	if useGPU {
+++		DoubleGPUInit(DB.Data, H1, A2_copy, DB.Info.X, p.delta())
+++	}
+++
++ 	return MakeState(H1, A2_copy), MakeMsg(H2)
++ }
++ 
++@@ -138,9 +142,9 @@ func (pi *DoublePIR) FakeSetup(DB *Database, p Params) (State, float64) {
++ 	H1.Add(p.P / 2)
++ 	H1.Squish(10, 3)
++ 
++-	A2_rows := p.L/info.X
++-	if A2_rows % 3 != 0 {
++-		A2_rows += (3-(A2_rows % 3))
+++	A2_rows := p.L / info.X
+++	if A2_rows%3 != 0 {
+++		A2_rows += (3 - (A2_rows % 3))
++ 	}
++ 	A2_copy := MatrixRand(p.N, A2_rows, p.Logq, 0)
++ 
++@@ -187,77 +191,106 @@ func (pi *DoublePIR) Query(i uint64, shared State, p Params, info DBinfo) (State
++ 
++ func (pi *DoublePIR) Answer(DB *Database, query MsgSlice, server State, shared State, p Params) Msg {
++ 	H1 := server.Data[0]
++-	A2_transpose := server.Data[1]
+++	A2t := server.Data[1]
++ 
++ 	a1 := new(Matrix)
++-	num_queries := uint64(len(query.Data))
++-	batch_sz := DB.Data.Rows / num_queries
++-
+++	numQueries := uint64(len(query.Data))
+++	batchSz := DB.Data.Rows / numQueries
++ 	last := uint64(0)
+++
+++	// For each batch, do everything on GPU and pull back only {h1, a2, h2}.
+++	msg := MakeMsg(MatrixZeros(0, 0))
++ 	for batch, q := range query.Data {
++-		q1 := q.Data[0]
++-		if batch == int(num_queries-1) {
++-			batch_sz = DB.Data.Rows - last
+++		if batch == int(numQueries-1) {
+++			batchSz = DB.Data.Rows - last
++ 		}
++-		a := MatrixMulVecPacked(DB.Data.SelectRows(last, batch_sz),
++-			                q1, DB.Info.Basis, DB.Info.Squishing)
++-		a1.Concat(a)
++-		last += batch_sz
++-	}
++ 
++-	a1.TransposeAndExpandAndConcatColsAndSquish(p.P, p.delta(), DB.Info.X, 10, 3)
++-        h1 := MatrixMulTransposedPacked(a1, A2_transpose, 10, 3)
++-	msg := MakeMsg(h1)
+++		if useGPU {
+++			// Allocate outputs
+++			h1Rows := p.delta() * DB.Info.X
+++			h1Cols := ((batchSz / DB.Info.X) + 3 - 1) / 3 // per TransposeExpand... (d=3)
+++			h1 := MatrixZeros(h1Rows, h1Cols)
++ 
++-	for _, q := range query.Data {
++-		for j := uint64(0); j < DB.Info.Ne/DB.Info.X; j++ {
++-			q2 := q.Data[1+j]
++-			a2 := MatrixMulVecPacked(H1, q2, 10, 3)
++-			h2 := MatrixMulVecPacked(a1, q2, 10, 3)
+++			a2All := MatrixZeros(H1.Rows*(DB.Info.Ne/DB.Info.X), 1)
+++			h2All := MatrixZeros(h1Rows*(DB.Info.Ne/DB.Info.X), 1)
++ 
++-			msg.Data = append(msg.Data, a2)
++-			msg.Data = append(msg.Data, h2)
+++			// Collect this batch’s q2’s
+++			var q2s []*Matrix
+++			for j := uint64(0); j < DB.Info.Ne/DB.Info.X; j++ {
+++				q2s = append(q2s, q.Data[1+j])
+++			}
+++
+++			DoubleGPUAnswerRange(q.Data[0], q2s, last, batchSz, h1, a2All, h2All)
+++
+++			// Append in the exact order your original Answer produces:
+++			msg.Data = append(msg.Data, h1)
+++			for j := uint64(0); j < DB.Info.Ne/DB.Info.X; j++ {
+++				// slice views for a2/h2 per query2
+++				a2 := a2All.RowsDeepCopy(j*H1.Rows, H1.Rows)
+++				h2 := h2All.RowsDeepCopy(j*h1Rows, h1Rows)
+++				msg.Data = append(msg.Data, a2, h2)
+++			}
+++		} else {
+++			// original CPU path
+++			a := MatrixMulVecPacked(DB.Data.SelectRows(last, batchSz), q.Data[0], DB.Info.Basis, DB.Info.Squishing)
+++			a1.Concat(a)
++ 		}
+++		last += batchSz
++ 	}
++ 
+++	if !useGPU {
+++		// original CPU h1/a2/h2 path (unchanged)
+++		a1.TransposeAndExpandAndConcatColsAndSquish(p.P, p.delta(), DB.Info.X, 10, 3)
+++		h1 := MatrixMulTransposedPacked(a1, A2t, 10, 3)
+++		out := MakeMsg(h1)
+++		for _, q := range query.Data {
+++			for j := uint64(0); j < DB.Info.Ne/DB.Info.X; j++ {
+++				q2 := q.Data[1+j]
+++				a2 := MatrixMulVecPacked(H1, q2, 10, 3)
+++				h2 := MatrixMulVecPacked(a1, q2, 10, 3)
+++				out.Data = append(out.Data, a2, h2)
+++			}
+++		}
+++		return out
+++	}
++ 	return msg
++ }
++ 
++ func (pi *DoublePIR) Recover(i uint64, batch_index uint64, offline Msg, query Msg,
++ 	answer Msg, shared State, client State, p Params, info DBinfo) uint64 {
++ 	H2 := offline.Data[0]
++-	h1 := answer.Data[0].RowsDeepCopy(0, answer.Data[0].Rows) // deep copy whole matrix 
+++	h1 := answer.Data[0].RowsDeepCopy(0, answer.Data[0].Rows) // deep copy whole matrix
++ 	secret1 := client.Data[0]
++ 
++-	ratio := p.P/2
+++	ratio := p.P / 2
++ 	val1 := uint64(0)
++-	for j := uint64(0); j<p.M; j++ {
++-		val1 += ratio*query.Data[0].Get(j,0)
+++	for j := uint64(0); j < p.M; j++ {
+++		val1 += ratio * query.Data[0].Get(j, 0)
++ 	}
++-	val1 %= (1<<p.Logq)
++-	val1 = (1<<p.Logq)-val1
+++	val1 %= (1 << p.Logq)
+++	val1 = (1 << p.Logq) - val1
++ 
++ 	val2 := uint64(0)
++-	for j := uint64(0); j<p.L/info.X; j++ {
++-		val2 += ratio*query.Data[1].Get(j,0)
+++	for j := uint64(0); j < p.L/info.X; j++ {
+++		val2 += ratio * query.Data[1].Get(j, 0)
++ 	}
++-	val2 %= (1<<p.Logq)
++-	val2 = (1<<p.Logq)-val2
+++	val2 %= (1 << p.Logq)
+++	val2 = (1 << p.Logq) - val2
++ 
++ 	A2 := shared.Data[1]
++ 	if (A2.Cols != p.N) || (h1.Cols != p.N) {
++ 		panic("Should not happen!")
++ 	}
++-	for j1 := uint64(0); j1<p.N; j1++ {
+++	for j1 := uint64(0); j1 < p.N; j1++ {
++ 		val3 := uint64(0)
++-	        for j2 := uint64(0); j2<A2.Rows; j2++ {
++-			val3 += ratio*A2.Get(j2,j1)
+++		for j2 := uint64(0); j2 < A2.Rows; j2++ {
+++			val3 += ratio * A2.Get(j2, j1)
++ 		}
++-		val3 %= (1<<p.Logq)
++-		val3 = (1<<p.Logq)-val3
+++		val3 %= (1 << p.Logq)
+++		val3 = (1 << p.Logq) - val3
++ 		v := C.Elem(val3)
++-		for k := uint64(0); k<h1.Rows; k++ {
++-                	h1.Data[k*h1.Cols+j1] += v
+++		for k := uint64(0); k < h1.Rows; k++ {
+++			h1.Data[k*h1.Cols+j1] += v
++ 		}
++ 	}
++ 
++diff --git a/pir/double_pir_cuda.cu b/pir/double_pir_cuda.cu
++new file mode 100644
++index 0000000..69e2b64
++--- /dev/null
+++++ b/pir/double_pir_cuda.cu
++@@ -0,0 +1,348 @@
+++// double_pir_cuda.cu
+++#include <cuda_runtime.h>
+++#include <cstdio>
+++#include "double_pir_cuda.h"
+++
+++#ifndef TILE_COLS
+++#define TILE_COLS 4096
+++#endif
+++
+++#ifndef BLOCK_SIZE
+++#define BLOCK_SIZE 1024
+++#endif
+++
+++static constexpr int  BASIS        = 10;
+++static constexpr int  COMPRESSION  = 3;
+++static constexpr Elem MASK         = (1u << BASIS) - 1u;
+++
+++#define CUDA_ASSERT(stmt) do { \
+++    cudaError_t err = (stmt);  \
+++    if (err != cudaSuccess) {  \
+++        fprintf(stderr, "CUDA error: %s (%s:%d)\n", cudaGetErrorString(err), __FILE__, __LINE__); \
+++        abort();               \
+++    }                          \
+++} while (0)
+++
+++// ------------------ Persistent device buffers ------------------
+++static Elem* d_DB   = nullptr;  static size_t DB_rows=0,  DB_cols=0;
+++static Elem* d_H1   = nullptr;  static size_t H1_rows=0,  H1_cols=0;
+++static Elem* d_A2t  = nullptr;  static size_t A2t_rows=0, A2t_cols=0;
+++
+++static Elem* d_q1   = nullptr;  static size_t cap_q1 = 0;
+++static Elem* d_q2   = nullptr;  static size_t cap_q2 = 0;
+++
+++static unsigned int g_X = 1;
+++static unsigned int g_delta = 1;
+++
+++// scratch
+++static unsigned long long* d_acc64 = nullptr;      // max(rows) accumulator
+++static size_t              cap_acc64 = 0;
+++static Elem*               d_vec_out = nullptr;    // staging for a single vec result
+++static size_t              cap_vec_out = 0;
+++
+++// ------------------ Kernels ------------------
+++
+++// Warp-span, shared-b tile, K rows/warp (same style as SimplePIR)
+++template<int K>
+++__global__ void matMulVecPackedWarpSpanTileK(Elem * __restrict__ out,
+++                                             const Elem * __restrict__ a,
+++                                             const Elem * __restrict__ b,
+++                                             size_t aRows, size_t aCols,
+++                                             size_t startRow, size_t numRows)
+++{
+++    const int lane   = threadIdx.x & 31;
+++    const int warpId = threadIdx.x >> 5;
+++    const int warpsPerBlock = blockDim.x >> 5;
+++
+++    const size_t warpPackBaseLocal =
+++        (size_t)blockIdx.x * (size_t)(warpsPerBlock * K) + (size_t)warpId * (size_t)K;
+++    if (warpPackBaseLocal >= numRows) return;
+++
+++    extern __shared__ Elem s_b[];
+++    Elem* s_b0 = s_b + 0 * TILE_COLS;
+++    Elem* s_b1 = s_b + 1 * TILE_COLS;
+++    Elem* s_b2 = s_b + 2 * TILE_COLS;
+++
+++    unsigned long long acc[K];
+++    #pragma unroll
+++    for (int r=0; r<K; ++r) acc[r] = 0ull;
+++
+++    for (size_t tileBase = 0; tileBase < aCols; tileBase += TILE_COLS) {
+++        const size_t tileCols = min((size_t)TILE_COLS, aCols - tileBase);
+++
+++        // cooperative b tile load
+++        for (size_t c = threadIdx.x; c < tileCols; c += blockDim.x) {
+++            const size_t j = tileBase + c;
+++            s_b0[c] = __ldg(&b[j * COMPRESSION + 0]);
+++            s_b1[c] = __ldg(&b[j * COMPRESSION + 1]);
+++            s_b2[c] = __ldg(&b[j * COMPRESSION + 2]);
+++        }
+++        __syncthreads();
+++
+++        #pragma unroll
+++        for (int r=0; r<K; ++r) {
+++            const size_t rowLocal = warpPackBaseLocal + (size_t)r;
+++            if (rowLocal >= numRows) break;
+++            const size_t row      = startRow + rowLocal;
+++            const size_t rowBaseA = row * aCols + tileBase;
+++
+++            for (size_t c = lane; c < tileCols; c += 32) {
+++                Elem db = __ldg(&a[rowBaseA + c]);
+++                Elem v0 =  db               & MASK;
+++                Elem v1 = (db >> BASIS)     & MASK;
+++                Elem v2 = (db >> (2*BASIS)) & MASK;
+++                acc[r] += (unsigned long long)v0 * (unsigned long long)s_b0[c];
+++                acc[r] += (unsigned long long)v1 * (unsigned long long)s_b1[c];
+++                acc[r] += (unsigned long long)v2 * (unsigned long long)s_b2[c];
+++            }
+++        }
+++        __syncthreads();
+++    }
+++
+++    // reduce & write
+++    #pragma unroll
+++    for (int r=0; r<K; ++r) {
+++        const size_t rowLocal = warpPackBaseLocal + (size_t)r;
+++        if (rowLocal >= numRows) break;
+++        unsigned long long v = acc[r];
+++        #pragma unroll
+++        for (int off=16; off>0; off>>=1) v += __shfl_down_sync(0xffffffff, v, off);
+++        if ((threadIdx.x & 31) == 0) out[startRow + rowLocal] = (Elem)v; // truncation == mod 2^w
+++    }
+++}
+++
+++// Extract f-th base-p digit from v (small delta => loop is fine).
+++__device__ __forceinline__ uint32_t base_p_digit(uint64_t v, uint32_t f, uint32_t p) {
+++    for (uint32_t i=0;i<f;++i) v /= p;
+++    return (uint32_t)(v % p);
+++}
+++
+++// Port of your Go function:
+++//   TransposeAndExpandAndConcatColsAndSquish(mod, delta, concat, basis, d)
+++// Input m: rows=R, cols=C (here C typically 1). Output n: rows=C*delta*concat, cols=(R/concat + d-1)/d
+++// We parallelize over (r, cIdx) and pack d limbs into one Elem -> single write, no atomics.
+++__global__ void transpose_expand_concat_squish_kernel(
+++    const Elem* __restrict__ m,  // size R*C (row-major)
+++    uint32_t R, uint32_t C,
+++    uint32_t mod_p, uint32_t delta, uint32_t concat, uint32_t basis, uint32_t d,
+++    Elem* __restrict__ n,        // out rows = C*delta*concat, cols = (R/concat + d-1)/d
+++    uint32_t nRows, uint32_t nCols)
+++{
+++    const uint32_t outLinear = blockIdx.x * blockDim.x + threadIdx.x;
+++    const uint32_t totalOut  = nRows * nCols;
+++    if (outLinear >= totalOut) return;
+++
+++    const uint32_t r = outLinear / nCols;       // 0..(C*delta*concat-1)
+++    const uint32_t cIdx = outLinear % nCols;    // 0..nCols-1
+++
+++    const uint32_t stripe = (r / delta) % concat;   // j % concat
+++    const uint32_t f      = (r % delta);            // which base-p digit
+++    const uint32_t Cmax   = (R + concat - 1) / concat; // ceil(R/concat)
+++
+++    uint64_t packed = 0ull;
+++
+++    // pack d columns: c = cIdx*d + t
+++    for (uint32_t t=0; t<d; ++t) {
+++        const uint32_t c = cIdx * d + t;
+++        if (c >= Cmax) break; // tail
+++        const uint32_t j = c * concat + stripe; // row index in input m
+++        if (j >= R) continue;
+++
+++        // m has C columns; here C is usually 1, but keep general:
+++        // value at (j,i) for i=0..C-1 are stacked by "i" in your original
+++        // We need i (column in m) such that r = (i*delta + f) + C*delta*(j%concat)
+++        // For general C, derive i from r:
+++        const uint32_t i = (r / delta) / concat; // because: r = (i*delta + f) + C*delta*(j%concat); when C==1 -> i==0
+++        if (i >= C) continue;
+++
+++        const uint64_t val = (uint64_t)m[j*C + i];
+++        const uint32_t digit = base_p_digit(val, f, mod_p);
+++
+++        packed += (uint64_t)digit << (basis * t); // shift by t==(c%d)
+++    }
+++
+++    n[r * nCols + cIdx] = (Elem)packed;
+++}
+++
+++// ------------------ Helpers ------------------
+++
+++static inline void ensure_buf(Elem** p, size_t* cap, size_t need) {
+++    if (*cap >= need) return;
+++    if (*p) CUDA_ASSERT(cudaFree(*p));
+++    CUDA_ASSERT(cudaMalloc(p, need * sizeof(Elem)));
+++    *cap = need;
+++}
+++
+++static inline void ensure_acc(size_t need64) {
+++    if (cap_acc64 >= need64) return;
+++    if (d_acc64) CUDA_ASSERT(cudaFree(d_acc64));
+++    CUDA_ASSERT(cudaMalloc(&d_acc64, need64 * sizeof(unsigned long long)));
+++    cap_acc64 = need64;
+++}
+++
+++static inline void ensure_vec(size_t need) {
+++    if (cap_vec_out >= need) return;
+++    if (d_vec_out) CUDA_ASSERT(cudaFree(d_vec_out));
+++    CUDA_ASSERT(cudaMalloc(&d_vec_out, need * sizeof(Elem)));
+++    cap_vec_out = need;
+++}
+++
+++// ------------------ Public API ------------------
+++
+++extern "C" void doublePIRGPUInit(const Elem* DB, size_t DB_r, size_t DB_c,
+++                                  const Elem* H1, size_t H1_r, size_t H1_c,
+++                                  const Elem* A2t, size_t A2t_r, size_t A2t_c,
+++                                  unsigned int X, unsigned int delta)
+++{
+++    DB_rows=DB_r; DB_cols=DB_c; H1_rows=H1_r; H1_cols=H1_c; A2t_rows=A2t_r; A2t_cols=A2t_c;
+++    g_X = X; g_delta = delta;
+++
+++    CUDA_ASSERT(cudaMalloc(&d_DB,  DB_r*DB_c*sizeof(Elem)));
+++    CUDA_ASSERT(cudaMalloc(&d_H1,  H1_r*H1_c*sizeof(Elem)));
+++    CUDA_ASSERT(cudaMalloc(&d_A2t, A2t_r*A2t_c*sizeof(Elem)));
+++
+++    CUDA_ASSERT(cudaMemcpy(d_DB,  DB,  DB_r*DB_c*sizeof(Elem),  cudaMemcpyHostToDevice));
+++    CUDA_ASSERT(cudaMemcpy(d_H1,  H1,  H1_r*H1_c*sizeof(Elem),  cudaMemcpyHostToDevice));
+++    CUDA_ASSERT(cudaMemcpy(d_A2t, A2t, A2t_r*A2t_c*sizeof(Elem),cudaMemcpyHostToDevice));
+++}
+++
+++
+++extern "C" void doublePIRGPUAnswerRange(const Elem* q1, size_t q1_len,
+++                                        const Elem* q2s, size_t q2_len, int numQ2,
+++                                        size_t startRow, size_t numRows,
+++                                        Elem* h1_out, size_t h1_rows, size_t h1_cols,
+++                                        Elem* a2_out_all, size_t a2_vec_len,
+++                                        Elem* h2_out_all, size_t h2_vec_len)
+++{
+++    // 1) upload q1
+++    ensure_buf(&d_q1, &cap_q1, q1_len);
+++    CUDA_ASSERT(cudaMemcpy(d_q1, q1, q1_len*sizeof(Elem), cudaMemcpyHostToDevice));
+++
+++    // 2) a1 := (DB[start:start+numRows] · q1)
+++    ensure_acc(numRows);
+++    {
+++        dim3 block(BLOCK_SIZE);
+++        const int warpsPerBlock = BLOCK_SIZE / 32;
+++        const int K = 4;
+++        const size_t rowsPerBlockLogical = (size_t)warpsPerBlock * (size_t)K;
+++        dim3 grid( (int)((numRows + rowsPerBlockLogical - 1) / rowsPerBlockLogical) );
+++        const size_t shmemBytes = (size_t)TILE_COLS * (size_t)COMPRESSION * sizeof(Elem);
+++
+++        matMulVecPackedWarpSpanTileK<4><<<grid, block, shmemBytes>>>(
+++            (Elem*)d_acc64,
+++            d_DB, d_q1, DB_rows, DB_cols, startRow, numRows);
+++    }
+++    CUDA_ASSERT(cudaGetLastError());
+++
+++    // 3) a1':= TransposeAndExpandAndConcatColsAndSquish(a1)
+++    //    m.Rows = numRows, m.Cols = 1
+++    //    n.Rows = (1 * delta * X), n.Cols = (numRows/X + d - 1)/d, where d=3, basis=10
+++    const uint32_t R = (uint32_t)numRows;
+++    const uint32_t C = 1u;
+++    const uint32_t d  = 3u;
+++    const uint32_t basis = 10u;
+++    const uint32_t nRows = C * g_delta * g_X;
+++    const uint32_t Cmax  = (R + g_X - 1) / g_X;
+++    const uint32_t nCols = (Cmax + d - 1) / d;
+++
+++    Elem* d_a1_packed = nullptr;
+++    CUDA_ASSERT(cudaMalloc(&d_a1_packed, (size_t)nRows * (size_t)nCols * sizeof(Elem)));
+++
+++    {
+++        const uint32_t totalOut = nRows * nCols;
+++        const int threads = 256;
+++        const int blocks = (int)((totalOut + threads - 1) / threads);
+++        transpose_expand_concat_squish_kernel<<<blocks, threads>>>(
+++            (Elem*)d_acc64, R, C,
+++            /*mod*/0u, g_delta, g_X, basis, d,
+++            d_a1_packed, nRows, nCols);
+++    }
+++    CUDA_ASSERT(cudaGetLastError());
+++
+++    // 4) h1 := a1_packed · A2ᵗ  (loop rows of A2ᵗ -> packed GEMV)
+++    ensure_vec(h1_rows * h1_cols);
+++    for (size_t rB = 0; rB < h1_rows; ++rB) {
+++        const Elem* d_b = d_A2t + rB * A2t_cols; // row rB, length nCols (packed with 3 limbs/col)
+++
+++        ensure_acc(nRows);
+++        {
+++            dim3 block(BLOCK_SIZE);
+++            const int warpsPerBlock = BLOCK_SIZE / 32;
+++            const int K = 4;
+++            const size_t rowsPerBlockLogical = (size_t)warpsPerBlock * (size_t)K;
+++            dim3 grid( (int)((nRows + rowsPerBlockLogical - 1) / rowsPerBlockLogical) );
+++            const size_t shmemBytes = (size_t)TILE_COLS * (size_t)COMPRESSION * sizeof(Elem);
+++
+++            matMulVecPackedWarpSpanTileK<4><<<grid, block, shmemBytes>>>(
+++                (Elem*)d_acc64, d_a1_packed, d_b, nRows, nCols, /*startRow*/0, /*numRows*/nRows);
+++        }
+++        CUDA_ASSERT(cudaGetLastError());
+++
+++        // Copy this column vector out (layout note remains as before)
+++        CUDA_ASSERT(cudaMemcpy(d_vec_out, d_acc64, nRows*sizeof(Elem), cudaMemcpyDeviceToDevice));
+++        CUDA_ASSERT(cudaMemcpy(h1_out + rB, d_vec_out, nRows*sizeof(Elem), cudaMemcpyDeviceToHost));
+++    }
+++
+++    // 5) For each q2: compute a single combined matvec on [H1; a1_packed]
+++    //    and split the outputs into a2 (top H1_rows) and h2 (bottom nRows).
+++    const size_t totalRows   = H1_rows + nRows;
+++    const size_t commonCols  = H1_cols; // expected to match nCols for packed layout
+++
+++    Elem* d_concat = nullptr;
+++    CUDA_ASSERT(cudaMalloc(&d_concat, totalRows * commonCols * sizeof(Elem)));
+++    // top: H1
+++    CUDA_ASSERT(cudaMemcpy(d_concat,
+++                           d_H1,
+++                           H1_rows * commonCols * sizeof(Elem),
+++                           cudaMemcpyDeviceToDevic
+\ No newline at end of file
+diff --git a/pir/gpu.go b/pir/gpu.go
+new file mode 100644
+index 0000000..eed6621
+--- /dev/null
++++ b/pir/gpu.go
+@@ -0,0 +1,65 @@
++package pir
++
++// #cgo CFLAGS: -O3 -march=native
++// #cgo LDFLAGS: -L. -lpir_cuda
++// #include "pir.h"
++// #include "simple_pir_cuda.h"
++// #include "double_pir_cuda.h"
++
++import "C"
++import (
++	"os"
++)
++
++var useGPU = os.Getenv("USE_GPU") == "1"
++
++func GPUInitDB(a *Matrix) {
++	C.matMulVecPackedGPUInit((*C.Elem)(&a.Data[0]), C.size_t(a.Rows), C.size_t(a.Cols))
++}
++
++func GPUCompute(b *Matrix, start, rows uint64) *Matrix {
++	out := MatrixNew(rows, 1)
++	C.matMulVecPackedGPUComputeRange(
++		(*C.Elem)(&out.Data[0]),
++		(*C.Elem)(&b.Data[0]),
++		C.size_t(start), C.size_t(rows),
++	)
++	return out
++}
++
++func GPUFree() {
++	C.matMulVecPackedGPUFree()
++}
++
++func DoubleGPUInit(DB, H1, A2t *Matrix, X, delta uint64) {
++	C.doublePIRGPUInit(
++		(*C.Elem)(&DB.Data[0]), C.size_t(DB.Rows), C.size_t(DB.Cols),
++		(*C.Elem)(&H1.Data[0]), C.size_t(H1.Rows), C.size_t(H1.Cols),
++		(*C.Elem)(&A2t.Data[0]), C.size_t(A2t.Rows), C.size_t(A2t.Cols),
++		C.uint(X), C.uint(delta),
++	)
++}
++
++func DoubleGPUAnswerRange(
++	q1 *Matrix,
++	q2s []*Matrix, // length = info.Ne/info.X
++	start, rows uint64,
++	h1_out *Matrix,
++	a2_all, h2_all *Matrix,
++) {
++	// flatten q2s
++	var flat []C.Elem
++	for _, q2 := range q2s {
++		flat = append(flat, q2.Data...)
++	}
++	C.doublePIRGPUAnswerRange(
++		(*C.Elem)(&q1.Data[0]), C.size_t(q1.Rows),
++		(*C.Elem)(&flat[0]), C.size_t(q2s[0].Rows), C.int(len(q2s)),
++		C.size_t(start), C.size_t(rows),
++		(*C.Elem)(&h1_out.Data[0]), C.size_t(h1_out.Rows), C.size_t(h1_out.Cols),
++		(*C.Elem)(&a2_all.Data[0]), C.size_t(a2_all.Rows), // vec-len per q2
++		(*C.Elem)(&h2_all.Data[0]), C.size_t(h2_all.Rows),
++	)
++}
++
++func DoubleGPUFree() { C.doublePIRGPUFree() }
+diff --git a/pir/matrix.go b/pir/matrix.go
+index ae56aa5..cea311a 100644
+--- a/pir/matrix.go
++++ b/pir/matrix.go
+@@ -1,9 +1,8 @@
+ package pir
+ 
+ // #cgo CFLAGS: -O3 -march=native
+-// #cgo LDFLAGS: -L. -lpir_cuda
+ // #include "pir.h"
+-// #include "simple_pir_cuda.h"
++
+ import "C"
+ import (
+ 	"fmt"
+@@ -251,23 +250,6 @@ func (m *Matrix) Transpose() {
+ 	m.Data = out.Data
+ }
+ 
+-func GPUInitDB(a *Matrix) {
+-	C.matMulVecPackedGPUInit((*C.Elem)(&a.Data[0]), C.size_t(a.Rows), C.size_t(a.Cols))
+-}
+-
+-func GPUCompute(b *Matrix, start, rows uint64) *Matrix {
+-	out := MatrixNew(rows, 1)
+-	C.matMulVecPackedGPUComputeRange(
+-		(*C.Elem)(&out.Data[0]),
+-		(*C.Elem)(&b.Data[0]),
+-		C.size_t(start), C.size_t(rows),
+-	)
+-	return out
+-}
+-
+-func GPUFree() {
+-	C.matMulVecPackedGPUFree()
+-}
+ 
+ func (a *Matrix) Concat(b *Matrix) {
+ 	if a.Cols == 0 && a.Rows == 0 {
+diff --git a/pir/pir.c b/pir/pir.c
+index 959ac3e..bc61af8 100644
+--- a/pir/pir.c
++++ b/pir/pir.c
+@@ -99,7 +99,7 @@ void matMulVec(Elem *out, const Elem *a, const Elem *b,
+ }
+ 
+ // CPU:
+-// tput: = 7.8 GB/s
++// SimplePIR tput: = 7.8 GB/s
+ void matMulVecPacked(Elem *out, const Elem *a, const Elem *b,
+     size_t aRows, size_t aCols)
+ {
+diff --git a/pir/simple_pir.go b/pir/simple_pir.go
+index 705c6bf..7b4a00d 100644
+--- a/pir/simple_pir.go
++++ b/pir/simple_pir.go
+@@ -5,11 +5,8 @@ package pir
+ import "C"
+ import (
+ 	"fmt"
+-	"os"
+ )
+ 
+-var useGPU = os.Getenv("USE_GPU") == "1"
+-
+ type SimplePIR struct{}
+ 
+ func (pi *SimplePIR) Name() string {

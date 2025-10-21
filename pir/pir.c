@@ -99,7 +99,7 @@ void matMulVec(Elem *out, const Elem *a, const Elem *b,
 }
 
 // CPU:
-// tput: = 7.8 GB/s
+// SimplePIR tput: = 7.8 GB/s
 void matMulVecPacked(Elem *out, const Elem *a, const Elem *b,
     size_t aRows, size_t aCols)
 {
