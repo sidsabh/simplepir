@@ -3,7 +3,7 @@ package pir
 // #cgo CFLAGS: -O3 -march=native
 // #cgo LDFLAGS: -L. -lpir_cuda
 // #include "pir.h"
-// #include "pir_cuda.h"
+// #include "simple_pir_cuda.h"
 import "C"
 import (
 	"fmt"
@@ -219,7 +219,7 @@ func MatrixMulVecPacked(a *Matrix, b *Matrix, basis, compression uint64) *Matrix
 	aPtr := (*C.Elem)(&a.Data[0])
 	bPtr := (*C.Elem)(&b.Data[0])
 
-	C.matMulVecPacked(outPtr, aPtr, bPtr, C.size_t(a.Rows), C.size_t(a.Cols))
+	C.matMulVecPackedUnrolled(outPtr, aPtr, bPtr, C.size_t(a.Rows), C.size_t(a.Cols))
 	out.DropLastRows(8)
 
 	return out

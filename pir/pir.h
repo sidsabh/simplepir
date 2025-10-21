@@ -16,3 +16,6 @@ void matMulVec(Elem *out, const Elem *a, const Elem *b,
 
 void matMulVecPacked(Elem *out, const Elem *a, const Elem *b,
     size_t aRows, size_t aCols);
+void matMulVecPackedUnrolled(Elem *out, const Elem *a, const Elem *b,
+    size_t aRows, size_t aCols);
+    

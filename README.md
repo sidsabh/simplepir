@@ -1,3 +1,24 @@
+# Accelerating SimplePIR,DoublePIR using CUDA
+
+## SimplePIR CUDA Acceleration
+This repository contains a CUDA implementation of the SimplePIR server to accelerate query processing using NVIDIA GPUs.
+
+To run, first compile:
+```
+cd pir/
+nvcc -O3 -arch=sm_61 -Xcompiler -fPIC -shared simple_pir_cuda.cu -o libpir_cuda.so
+```
+Then, export the library path and run the benchmark:
+```
+LD_LIBRARY_PATH=$(pwd) LOG_N=33 D=1 USE_GPU=1 go test -bench SimplePirSingle -timeout 0 -run=^
+```
+
+Stats are annotated on kernels using the following machines:
+- CPU: Intel i7-3770 + DRAM
+- GPU: NVIDIA GTX 1080
+
+
+
 # One Server for the Price of Two: Simple and Fast Single-Server Private Information Retrieval
 
 This repository contains the code for SimplePIR and DoublePIR, two high-throughput single-server PIR schemes presented in the paper ["One Server for the Price of Two: Simple and Fast Single-Server Private Information Retrieval"](https://eprint.iacr.org/2022/949) by Alexandra Henzinger, Matthew M. Hong, Henry Corrigan-Gibbs, Sarah Meiklejohn, and Vinod Vaikuntanathan (USENIX Security 2023).

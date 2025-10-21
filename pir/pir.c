@@ -98,7 +98,34 @@ void matMulVec(Elem *out, const Elem *a, const Elem *b,
   }
 }
 
+// CPU:
+// tput: = 7.8 GB/s
 void matMulVecPacked(Elem *out, const Elem *a, const Elem *b,
+    size_t aRows, size_t aCols)
+{
+  Elem db;
+  Elem val;
+  Elem tmp;
+  size_t index = 0;
+
+  for (size_t i = 0; i < aRows; i++) {
+    tmp = 0;
+    for (size_t j = 0; j < aCols; j++) {
+      db = a[index++];
+      val = db & MASK;
+      tmp += val*b[j];
+      val = (db >> BASIS) & MASK;
+      tmp += val*b[j];
+      val = (db >> BASIS2) & MASK;
+      tmp += val*b[j];
+    }
+    out[i] = tmp;
+  }
+}
+
+// CPU unrolled:
+// tput: 7.6 GB/s
+void matMulVecPackedUnrolled(Elem *out, const Elem *a, const Elem *b,
     size_t aRows, size_t aCols)
 {
   Elem db, db2, db3, db4, db5, db6, db7, db8;
