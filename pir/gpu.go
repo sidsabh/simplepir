@@ -40,26 +40,30 @@ func DoubleGPUInit(DB, H1, A2t *Matrix, X, delta uint64) {
 	)
 }
 
-func DoubleGPUAnswerRange(
-	q1 *Matrix,
-	q2s []*Matrix, // length = info.Ne/info.X
-	start, rows uint64,
+func DoubleGPUAnswerFull(
+	q1s []*Matrix,       // All q1 queries (one per batch)
+	q2s_all []*Matrix,   // All q2 queries (Ne/X per batch)
 	modP uint32,
 	h1_out *Matrix,
 	a2_all, h2_all *Matrix,
+	H1_rows uint64,      // H1.Rows from server state
 ) {
-	// flatten q2s
-	var flat []C.Elem
-	for _, q2 := range q2s {
-		flat = append(flat, q2.Data...)
+	// Flatten q1s
+	var q1_flat []C.Elem
+	for _, q1 := range q1s {
+		q1_flat = append(q1_flat, q1.Data...)
 	}
-	C.doublePIRGPUAnswerRange(
-		(*C.Elem)(&q1.Data[0]), C.size_t(q1.Rows),
-		(*C.Elem)(&flat[0]), C.size_t(q2s[0].Rows), C.int(len(q2s)),
-		C.size_t(start), C.size_t(rows),
+	// Flatten q2s
+	var q2_flat []C.Elem
+	for _, q2 := range q2s_all {
+		q2_flat = append(q2_flat, q2.Data...)
+	}
+	C.doublePIRGPUAnswerFull(
+		(*C.Elem)(&q1_flat[0]), C.size_t(q1s[0].Rows), C.int(len(q1s)),
+		(*C.Elem)(&q2_flat[0]), C.size_t(q2s_all[0].Rows), C.int(len(q2s_all)),
 		C.uint(modP),
 		(*C.Elem)(&h1_out.Data[0]), C.size_t(h1_out.Rows), C.size_t(h1_out.Cols),
-		(*C.Elem)(&a2_all.Data[0]), C.size_t(a2_all.Rows), // vec-len per q2
+		(*C.Elem)(&a2_all.Data[0]), C.size_t(H1_rows),
 		(*C.Elem)(&h2_all.Data[0]), C.size_t(h2_all.Rows),
 	)
 }

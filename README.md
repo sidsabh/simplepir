@@ -8,9 +8,10 @@ To run, first compile:
 cd pir/
 nvcc -O3 -arch=sm_61 -Xcompiler -fPIC -shared simple_pir_cuda.cu double_pir_cuda.cu -o libpir_cuda.so
 ```
-Then, export the library path and run the benchmark:
+Then, export the library path and run the benchmarks:
 ```
 LD_LIBRARY_PATH=$(pwd) LOG_N=33 D=1 USE_GPU=1 go test -bench SimplePirSingle -timeout 0 -run=^$
+LD_LIBRARY_PATH=$(pwd) LOG_N=33 D=1 USE_GPU=1 go test -bench DoublePirSingle -timeout 0 -run=^$
 ```
 
 Stats are annotated on kernels using the following machines:
@@ -21,7 +22,7 @@ Stats are annotated on kernels using the following machines:
       - Theoretical max badnwidth: 320 GB/s
       - Max memory bandwidth (kernel that reads A from GPU memory): 185 GB/s
       - SimplePIR: 177 GB/s
-      - DoublePIR: 105 GB/s
+      - DoublePIR: 120 GB/s
 
 
 # One Server for the Price of Two: Simple and Fast Single-Server Private Information Retrieval

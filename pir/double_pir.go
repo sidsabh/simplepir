@@ -197,67 +197,71 @@ func (pi *DoublePIR) Answer(DB *Database, query MsgSlice, server State, shared S
 	H1 := server.Data[0]
 	A2t := server.Data[1]
 
+	if useGPU {
+		// GPU path: collect ALL q1 and q2 queries, process entire DB at once
+		var q1s []*Matrix
+		var q2s_all []*Matrix
+		for _, q := range query.Data {
+			q1s = append(q1s, q.Data[0])
+			// Each batch has Ne/X q2 queries
+			for j := uint64(0); j < DB.Info.Ne/DB.Info.X; j++ {
+				q2s_all = append(q2s_all, q.Data[1+j])
+			}
+		}
+
+		// Allocate outputs
+		h1Rows := p.delta() * DB.Info.X
+		h1 := MatrixZeros(h1Rows, p.N)
+		totalQ2s := uint64(len(query.Data)) * (DB.Info.Ne / DB.Info.X)
+		a2All := MatrixZeros(H1.Rows*totalQ2s, 1)
+		h2All := MatrixZeros(h1Rows*totalQ2s, 1)
+
+		// Process entire DB with all batches on GPU
+		DoubleGPUAnswerFull(q1s, q2s_all, uint32(p.P), h1, a2All, h2All, H1.Rows)
+
+		// Build output message
+		msg := MakeMsg(h1)
+		for i := uint64(0); i < uint64(len(query.Data)); i++ {
+			for j := uint64(0); j < DB.Info.Ne/DB.Info.X; j++ {
+				q2Idx := i*(DB.Info.Ne/DB.Info.X) + j
+				a2 := a2All.RowsDeepCopy(q2Idx*H1.Rows, H1.Rows)
+				h2 := h2All.RowsDeepCopy(q2Idx*h1Rows, h1Rows)
+				msg.Data = append(msg.Data, a2, h2)
+			}
+		}
+		return msg
+	}
+
+	// CPU path
 	a1 := new(Matrix)
 	numQueries := uint64(len(query.Data))
 	batchSz := DB.Data.Rows / numQueries
 	last := uint64(0)
-
-	// For each batch, do everything on GPU and pull back only {h1, a2, h2}.
-	msg := MakeMsg(MatrixZeros(0, 0))
 	for batch, q := range query.Data {
 		if batch == int(numQueries-1) {
 			batchSz = DB.Data.Rows - last
 		}
-
-		if useGPU {
-			// Allocate outputs
-			h1Rows := p.delta() * DB.Info.X
-			h1 := MatrixZeros(h1Rows, p.N)
-
-			a2All := MatrixZeros(H1.Rows*(DB.Info.Ne/DB.Info.X), 1)
-			h2All := MatrixZeros(h1Rows*(DB.Info.Ne/DB.Info.X), 1)
-
-			// Collect this batch’s q2’s
-			var q2s []*Matrix
-			for j := uint64(0); j < DB.Info.Ne/DB.Info.X; j++ {
-				q2s = append(q2s, q.Data[1+j])
-			}
-
-			DoubleGPUAnswerRange(q.Data[0], q2s, last, batchSz, uint32(p.P), h1, a2All, h2All)
-
-			// Append in the exact order your original Answer produces:
-			msg.Data = append(msg.Data, h1)
-			for j := uint64(0); j < DB.Info.Ne/DB.Info.X; j++ {
-				// slice views for a2/h2 per query2
-				a2 := a2All.RowsDeepCopy(j*H1.Rows, H1.Rows)
-				h2 := h2All.RowsDeepCopy(j*h1Rows, h1Rows)
-				msg.Data = append(msg.Data, a2, h2)
-			}
-		} else {
-			// original CPU path
-			a := MatrixMulVecPacked(DB.Data.SelectRows(last, batchSz), q.Data[0], DB.Info.Basis, DB.Info.Squishing)
-			a1.Concat(a)
-		}
+		a := MatrixMulVecPacked(DB.Data.SelectRows(last, batchSz), q.Data[0], DB.Info.Basis, DB.Info.Squishing)
+		a1.Concat(a)
 		last += batchSz
 	}
 
-	if !useGPU {
-		// original CPU h1/a2/h2 path (unchanged)
-		a1.TransposeAndExpandAndConcatColsAndSquish(p.P, p.delta(), DB.Info.X, 10, 3)
-		h1 := MatrixMulTransposedPacked(a1, A2t, 10, 3)
-		out := MakeMsg(h1)
-		for _, q := range query.Data {
-			for j := uint64(0); j < DB.Info.Ne/DB.Info.X; j++ {
-				q2 := q.Data[1+j]
-				a2 := MatrixMulVecPacked(H1, q2, 10, 3)
-				h2 := MatrixMulVecPacked(a1, q2, 10, 3)
-				out.Data = append(out.Data, a2, h2)
-			}
+	a1.TransposeAndExpandAndConcatColsAndSquish(p.P, p.delta(), DB.Info.X, 10, 3)
+	h1 := MatrixMulTransposedPacked(a1, A2t, 10, 3)
+	out := MakeMsg(h1)
+	for _, q := range query.Data {
+		for j := uint64(0); j < DB.Info.Ne/DB.Info.X; j++ {
+			q2 := q.Data[1+j]
+			a2 := MatrixMulVecPacked(H1, q2, 10, 3)
+			h2 := MatrixMulVecPacked(a1, q2, 10, 3)
+			out.Data = append(out.Data, a2, h2)
 		}
-		return out
 	}
-	return msg
+
+	return out
 }
+
+
 
 func (pi *DoublePIR) Recover(i uint64, batch_index uint64, offline Msg, query Msg,
 	answer Msg, shared State, client State, p Params, info DBinfo) uint64 {
